@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+app
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (too large for GitHub)
+model/*.rknn
+*.mp4
+*.avi
+*.mpg
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+output.avi
+input1.mp4
+
+# 3rdparty binaries (keep headers)
+3rdparty/*/lib/
+3rdparty/*/*.so
