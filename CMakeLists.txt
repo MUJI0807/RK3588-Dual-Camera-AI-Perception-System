@@ -78,6 +78,8 @@ add_executable(app
     thread_poll.cpp
     yolov5s.cpp
     post_process.cpp
+    lane_detector.cpp
+    unet_lane_detector.cpp
     opencl_undistort.cpp
     streamer.c
     rtmp.c
