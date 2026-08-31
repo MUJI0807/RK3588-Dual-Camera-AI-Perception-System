@@ -54,5 +54,7 @@ private:
 
     // 一个或多个 YOLO 模型实例，例如多线程使用
     std::vector<std::shared_ptr<Yolov5s>> yolo_group;
+    // submit_task_async 的任务可被任意 worker 执行；每个 RKNN context 需要独占保护。
+    std::vector<std::shared_ptr<std::mutex>> yolo_mutexes;
 };
 #endif

@@ -12,13 +12,13 @@ typedef struct {
     int height;                 // 视频高度
     int max_b_frames;          // 最大B帧数
     
-    int fps;
+    int fps;                    // 帧率
 
     // 编码器参数
     enum AVCodecID codec_id;    // 编码器ID
     enum AVPixelFormat pix_fmt; // 像素格式
-    int profile;               // H.264 profile
-    int level;                 // H.264 level
+    int profile;               // H.264 profile, 如 baseline, main, high
+    int level;                 // H.264 level, 如 3.1, 4.0
     
     // SPS/PPS数据
     uint8_t *extradata;        // SPS/PPS数据
@@ -32,7 +32,7 @@ typedef struct {
  * @param config 流媒体配置参数
  * @return 成功返回0，失败返回-1
  */
-int init_rtmp_streamer(char* stream, RtmpContext *config);
+int init_rtmp_streamer(char* stream, RtmpContext *config);      // 初始化RTMP流媒体推送器
 
 /**
  * 写入一帧数据

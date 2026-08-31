@@ -4,6 +4,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <utility>
 using namespace std;
 
 template<typename T>
@@ -18,17 +19,37 @@ public:
     void enqueue(const T &t )
     {
         unique_lock<mutex> lock(m);
-        cond_not_full.wait(lock, [this]{return q.size() < maxSize;});
+        cond_not_full.wait(lock, [this]{return q.size() < maxSize || stop_flag;});
+        if(stop_flag) return;
         
         q.push(t);
         cond_not_empty.notify_one();
+    }
+
+    // 实时视频不能无限等待：队列满时让调用方丢弃当前帧。
+    bool try_enqueue(const T &t)
+    {
+        unique_lock<mutex> lock(m);
+        if(stop_flag || q.size() >= maxSize) return false;
+        q.push(t);
+        cond_not_empty.notify_one();
+        return true;
+    }
+
+    bool try_enqueue(T &&t)
+    {
+        unique_lock<mutex> lock(m);
+        if(stop_flag || q.size() >= maxSize) return false;
+        q.push(std::move(t));
+        cond_not_empty.notify_one();
+        return true;
     }
 
     // 从队列弹出
     bool dequeue(T &t)
     {
         unique_lock<mutex> lock(m);
-        cond_not_empty.wait(lock,[this] { return !q.empty(); });
+        cond_not_empty.wait(lock,[this] { return !q.empty() || stop_flag; });
         if(stop_flag && q.empty()) {
             // 若收到停止信号且队列也空了，就返回 false
             return false;
@@ -37,6 +58,16 @@ public:
         t = q.front();
         q.pop();
         
+        cond_not_full.notify_one();
+        return true;
+    }
+
+    bool try_dequeue(T &t)
+    {
+        unique_lock<mutex> lock(m);
+        if(q.empty()) return false;
+        t = std::move(q.front());
+        q.pop();
         cond_not_full.notify_one();
         return true;
     }
