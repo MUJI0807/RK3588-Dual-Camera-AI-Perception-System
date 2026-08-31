@@ -219,6 +219,46 @@ For production deployment, replace with real calibration parameters obtained fro
 4. **Bounded Queue with Drop Policy**: Prevents memory bloat under load
 5. **Graceful Degradation**: OpenCL initialization failure doesn't crash the pipeline
 
+## Release History & Changelog
+
+### v8.0 (2026-08-31) — Dual-Camera YOLO + OpenCL Undistortion, 15 bug fixes
+
+Fixes in commit 9034a53:
+
+#### P0 Critical (crash / corrupted stream / data race)
+
+- Concurrent lane/UNet state race: 3 NPU worker threads shared file-scope globals (g_unet_lane, g_smooth_*, g_candidate, ...) without locking → added g_assist_mutex around draw_driving_assist; inference still runs in parallel.
+- RTMP infinite retry: avio_open retried forever when server unreachable → bounded to 3 attempts.
+- All packets marked KEY: every frame carried AV_PKT_FLAG_KEY (P-frames treated as keyframes → playback artifacts) → NALU type detection, KEY only for IDR(5)/SPS(7)/PPS(8).
+- MPP init failure ignored: init_streamer continued with an uninitialized encoder → fail-fast with cleanup.
+- RKNN load failure silent: model load/init errors now throw std::runtime_error instead of running with a dead context.
+- Unhandled worker exception: compositor future.get() wrapped in try/catch.
+
+#### P1 Medium (resource leaks / visual defects / hardcoded behavior)
+
+- OpenCL release leak: release() now frees every resource pointer and all init failure paths go through unified cleanup.
+- Undistort black border: out-of-range sampling returned black → clamped to image edge (removes the black frame around the undistorted image).
+- Redundant clFinish: removed extra full-pipeline sync in undistort().
+- 300s hardcoded exit: runtime duration now configurable via argv[8] (0 = run forever, default 300s keeps old behavior).
+- Init failure leaks in streamer.c / rtmp.c: all failure paths now release mpp ctx / SPS-PPS / rtmp ctx / codec ctx safely.
+- ThreadPoll size race: tasks.size() reads now locked.
+- MPP packet leak: mpp_packet_init_with_buffer failure path deinits packet.
+- Box offset for non-16-aligned resolutions: detection boxes are remapped from padded to original image coordinates (e.g. 1920x1080 cameras).
+
+#### Minor
+
+- print_tensor_attr now actually prints tensor info; printf format specifiers fixed (%u for uint32_t fields).
+
+### Earlier Versions (feature evolution)
+
+| Version | Description |
+|---------|-------------|
+| v4.0 | OTA upgrade package, single camera, YOLOv5s/YOLOv6s + UNet lane lines |
+| v5.0 | Single-camera (/dev/video0 YUYV) YOLOv5s RKNN + RTMP streaming |
+| v6.0 | Dual-camera retrofit: MIPI /dev/video11 + USB /dev/video20, 2 capture threads, 3-instance RKNN pool, side-by-side compositing |
+| v7.0 | Same codebase as v6.0 (repackaged) |
+| v8.0 | Dual-camera + OpenCL undistortion (Mali-G610) + YOLOv5s + UNet lane lines |
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details
