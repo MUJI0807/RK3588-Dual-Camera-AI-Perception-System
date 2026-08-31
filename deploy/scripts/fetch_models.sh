@@ -14,7 +14,11 @@ ROOT="$(pwd)"
 MODEL_DIR="$ROOT/model"
 mkdir -p "$MODEL_DIR"
 
-REPO="GatekeeperZA/Qwen3-VL-2B-Instruct-RKLLM-v1.2.3"
+# 默认：最轻量 Qwen3.5-0.8B（RK3588 实测 1.3GB RAM / 21.6 tok/s，rkllm 1.3.0）
+REPO="Qengineering/Qwen3.5-0.8B-rk3588"
+# 备选：Qwen3-VL-2B（3.1GB / 11.5 tok/s，rkllm 1.2.3）：
+#   REPO="Qengineering/Qwen3-VL-2B-rk3588"  （HF）
+#   或直连服务器: https://storage.qengineering.eu/qwen3-vl-2b-instruct_w8a8_rk3588.rkllm
 HF_BASE="https://huggingface.co/$REPO/resolve/main"
 
 echo "========== [1/2] YOLOv5s 模型 =========="

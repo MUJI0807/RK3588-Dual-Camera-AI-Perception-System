@@ -76,6 +76,13 @@ if(RKLLM_INCLUDE_DIR AND RKLLM_LIBRARY)
     add_definitions(-DQWEN_ENABLED)
     include_directories(${RKLLM_INCLUDE_DIR})
     set(RKLLM_LIBS ${RKLLM_LIBRARY})
+    # API 版本选择：
+    #   ON  = RKLLM 1.3.0 新版多模态 API（Qwen3.5-0.8B 等新模型，推荐）
+    #   OFF = RKLLM 1.2.3 旧版 API（Qwen3-VL-2B / Qwen2-VL）
+    option(QWEN_RKLLM_130 "Use RKLLM 1.3.0 new multimodal API (Qwen3.5-0.8B)" ON)
+    if(QWEN_RKLLM_130)
+        add_definitions(-DQWEN_RKLLM_130)
+    endif()
 else()
     message(STATUS "RKLLM not found: Qwen risk analyzer disabled (shell only)")
     set(RKLLM_LIBS "")

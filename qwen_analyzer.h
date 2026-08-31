@@ -45,6 +45,8 @@ typedef struct {
     int model_width;
     int model_height;
     int model_channel;
+    int model_image_token = 0;   // 每张图 image token 数（从输出 shape 动态读取）
+    int model_embed_size  = 0;   // 每 token embedding 维度（动态读取）
 } QwenVisionContext;
 #endif
 

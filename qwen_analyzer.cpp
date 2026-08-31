@@ -21,15 +21,15 @@
 
 namespace {
 
-// ---------- 模型相关参数（★ 需按实际 Qwen3-VL-2B 转换模型核对/调整） ----------
-// 视觉编码输入尺寸：官方 Qwen2-VL-2B 用 392；Qwen3-VL 常见 448/672/896，
-// 以你转换出的 rknn 模型 input 尺寸为准（init 时会自动读取模型实际尺寸，
-// 这里作为 "expand2square + resize" 的目标尺寸）。
-constexpr int    kDefaultVisionSize    = 392;
-constexpr int    kNImageTokens        = 196;      // n_image_tokens（按模型）
-constexpr int    kImageEmbedLen       = 1536;     // 每 token 的 embedding 维度（按模型）
-constexpr int    kMaxNewTokens        = 512;      // 最大生成 token 数
-constexpr int    kMaxContextLen       = 4096;     // 最大上下文长度
+// ---------- 模型相关参数 ----------
+// 视觉编码输入尺寸：Qwen3-VL-2B / Qwen3.5-0.8B 均用 448x448。
+// n_image_tokens / embed_size 从 RKNN 模型输出 shape【动态读取】（见 init_vision），
+// 下面的常量仅作为"模型输出信息缺失"时的回退值。
+constexpr int    kDefaultVisionSize    = 448;
+constexpr int    kFallbackImageTokens  = 256;     // 回退：n_image_tokens
+constexpr int    kFallbackEmbedLen     = 1536;    // 回退：每 token embedding 维度
+constexpr int    kMaxNewTokens         = 512;     // 最大生成 token 数
+constexpr int    kMaxContextLen        = 4096;    // 最大上下文长度
 const char* const kImgStart           = "<|vision_start|>";
 const char* const kImgEnd             = "<|vision_end|>";
 const char* const kImgContent         = "<|image_pad|>";
@@ -160,8 +160,11 @@ bool QwenAnalyzer::analyze(const cv::Mat& frame_bgr,
         out_json.clear();
         return false;
     }
-    if ((int)image_embed.size() < kNImageTokens * kImageEmbedLen) {
-        std::fprintf(stderr, "[Qwen] image_embed too small: %zu\n", image_embed.size());
+    const int n_image_tokens = vision_ctx_.model_image_token;
+    const int embed_size = vision_ctx_.model_embed_size;
+    if ((int)image_embed.size() < n_image_tokens * embed_size) {
+        std::fprintf(stderr, "[Qwen] image_embed too small: %zu (expect %d)\n",
+                     image_embed.size(), n_image_tokens * embed_size);
         out_json.clear();
         return false;
     }
@@ -172,9 +175,23 @@ bool QwenAnalyzer::analyze(const cv::Mat& frame_bgr,
     RKLLMInput rkllm_input;
     std::memset(&rkllm_input, 0, sizeof(rkllm_input));
     rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
+#ifdef QWEN_RKLLM_130
+    // RKLLM 1.3.0 新版多模态结构（Qwen3.5-0.8B 等新模型）
+    rkllm_input.multimodal_input.prompt = const_cast<char*>(user_prompt.c_str());
+    rkllm_input.multimodal_input.image.image_embed = img_vec;
+    rkllm_input.multimodal_input.image.n_image_tokens = n_image_tokens;
+    rkllm_input.multimodal_input.image.n_image = 1;
+    rkllm_input.multimodal_input.image.image_height = vision_ctx_.model_height;
+    rkllm_input.multimodal_input.image.image_width = vision_ctx_.model_width;
+    rkllm_input.multimodal_input.image.image_start = const_cast<char*>(kImgStart);
+    rkllm_input.multimodal_input.image.image_end = const_cast<char*>(kImgEnd);
+    rkllm_input.multimodal_input.image.image_content = const_cast<char*>(kImgContent);
+#else
+    // RKLLM 1.2.3 旧版多模态结构（Qwen2-VL / Qwen3-VL-2B 官方 demo）
     rkllm_input.multimodal_input.prompt = const_cast<char*>(user_prompt.c_str());
     rkllm_input.multimodal_input.image_embed = img_vec;
-    rkllm_input.multimodal_input.n_image_tokens = kNImageTokens;
+    rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
+#endif
 
     RKLLMInferParam infer_params;
     std::memset(&infer_params, 0, sizeof(infer_params));
@@ -306,9 +323,28 @@ bool QwenAnalyzer::init_vision(const char* model_path)
         vision_ctx_.model_width   = vision_ctx_.input_attrs[0].dims[2];
         vision_ctx_.model_channel = vision_ctx_.input_attrs[0].dims[3];
     }
+
+    // 动态读取 image token 数与 embedding 维度：
+    // 视觉编码器输出 shape 通常为 [1, n_image_tokens, embed_size]，
+    // 取第一个 >1 的维度为 token 数，其后一维为 embedding 维度。
+    vision_ctx_.model_image_token = 0;
+    vision_ctx_.model_embed_size  = 0;
+    if (io_num.n_output >= 1) {
+        for (int i = 0; i < vision_ctx_.output_attrs[0].n_dims - 1; ++i) {
+            if (vision_ctx_.output_attrs[0].dims[i] > 1) {
+                vision_ctx_.model_image_token = vision_ctx_.output_attrs[0].dims[i];
+                vision_ctx_.model_embed_size  = vision_ctx_.output_attrs[0].dims[i + 1];
+                break;
+            }
+        }
+    }
+    if (vision_ctx_.model_image_token <= 0) vision_ctx_.model_image_token = kFallbackImageTokens;
+    if (vision_ctx_.model_embed_size  <= 0) vision_ctx_.model_embed_size  = kFallbackEmbedLen;
+
     vision_loaded_ = true;
-    std::fprintf(stderr, "[Qwen] vision input %dx%dx%d\n",
-                 vision_ctx_.model_height, vision_ctx_.model_width, vision_ctx_.model_channel);
+    std::fprintf(stderr, "[Qwen] vision input %dx%dx%d, image_token=%d embed=%d\n",
+                 vision_ctx_.model_height, vision_ctx_.model_width, vision_ctx_.model_channel,
+                 vision_ctx_.model_image_token, vision_ctx_.model_embed_size);
     return true;
 }
 
