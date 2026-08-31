@@ -1177,8 +1177,10 @@ int main(int argc, char** argv)
         : "../model/Qwen3-VL-2B_llm_w8a8_rk3588.rkllm";
     const std::string qwen_vision = argc > 10 ? argv[10]
         : "../model/Qwen3-VL-2B_vision_rk3588.rknn";
+    // 运行期开关：argv[9] 为 "off" 时旁路不加载（配合一键部署 config.env 的 QWEN 开关）
+    const bool qwen_on = argc > 9 && std::strcmp(argv[9], "off") != 0;
     std::thread qwen_worker;
-    if (g_qwen.initialize(qwen_llm.c_str(), qwen_vision.c_str())) {
+    if (qwen_on && g_qwen.initialize(qwen_llm.c_str(), qwen_vision.c_str())) {
         qwen_worker = std::thread(qwen_analysis_thread);
         std::cerr << "[Main] Qwen risk analyzer started (旁路)\n";
     } else {
