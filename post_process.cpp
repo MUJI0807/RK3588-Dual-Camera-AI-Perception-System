@@ -6,6 +6,10 @@
 #include <fstream>
 #include <map>
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <mutex>
+#include <unistd.h>
 
 using namespace std;
 
@@ -19,6 +23,22 @@ struct ProbArray
 };
 cv::Mat test_img;
 static vector<string> labels;
+static std::once_flag labels_once;
+
+static std::string label_path_from_executable()
+{
+    std::array<char, 4096> executable_path{};
+    const ssize_t length = readlink("/proc/self/exe",
+                                    executable_path.data(),
+                                    executable_path.size() - 1);
+    if (length <= 0) return LABLE_PATH;
+
+    const std::string full_path(executable_path.data(),
+                                static_cast<size_t>(length));
+    const size_t slash = full_path.find_last_of('/');
+    if (slash == std::string::npos) return LABLE_PATH;
+    return full_path.substr(0, slash) + "/../model/coco_80_labels_list.txt";
+}
 
 // Sigmoid 函数：计算输入值的 sigmoid 结果
 static float sigmoid(float x)
@@ -104,13 +124,14 @@ int readLines(const char * LablePath, vector<string> &lable_vector, int maxLines
     if (!file.is_open())
     {
         std::cerr << "file " << LablePath << " can not open!" << endl;
+        return 0;
     }
 
     string line;
     while (getline(file, line))
     {
         lable_vector.emplace_back(line);
-        if (lable_vector.size() > static_cast<size_t>(maxLines))
+        if (lable_vector.size() >= static_cast<size_t>(maxLines))
         {
             break;
         }
@@ -125,8 +146,25 @@ int LoadLableName(const char * filepath, vector<string> &lable_vector, int num_l
     {
         // cout << "标签数量是 " << line_num << endl;
     }
-    std::cout << "labels.size()=" << labels.size() << std::endl;
     return line_num;
+}
+
+static void load_labels_once()
+{
+    const std::string path = label_path_from_executable();
+    labels.clear();
+    const int loaded = LoadLableName(path.c_str(), labels, OBJ_CLASS_NUM);
+    if (loaded != OBJ_CLASS_NUM) {
+        std::cerr << "[Labels] expected " << OBJ_CLASS_NUM << " labels, loaded "
+                  << loaded << " from " << path << "; using class_N fallback\n";
+        labels.clear();
+        labels.reserve(OBJ_CLASS_NUM);
+        for (int id = 0; id < OBJ_CLASS_NUM; ++id) {
+            labels.emplace_back("class_" + std::to_string(id));
+        }
+    } else {
+        std::cerr << "[Labels] loaded " << loaded << " labels from " << path << '\n';
+    }
 }
 
 static float deqnt_int8_to_f32(int int_num, int32_t zp, float scale)
@@ -279,20 +317,8 @@ int post_process(int8_t *output0, int8_t *output1, int8_t *output2,
                  float nms_threshold, float scale_w, float scale_h,
                  std::vector<int32_t>& qnt_zps, std::vector<float>& qnt_scales, detect_result_group_t &result_group)
 {
-    // 1. 加载标签
-    static bool g_labels_loaded = false;
-    if(!g_labels_loaded)
-    {
-        // 只有第一次才加载标签文件
-        int nlines = LoadLableName(LABLE_PATH, labels, OBJ_CLASS_NUM);
-        g_labels_loaded = true;
-    }
-    else
-    {
-        // 后续不再重复加载
-        // 如果你仍想打印，可以查看 labels.size() 之类
-        // cout << "已加载过标签, labels.size()=" << labels.size() << endl;
-    }
+    // 三个 NPU worker 可能同时进入后处理，只允许一个线程初始化全局标签表。
+    std::call_once(labels_once, load_labels_once);
     // for (string &s : labels)
     // {
     //     cout << "lable name " << s << endl;
@@ -403,9 +429,16 @@ int post_process(int8_t *output0, int8_t *output1, int8_t *output2,
         result_group.result[count].box.ymax = (int)(clamp(ymax, 0, model_height) / scale_h);
         result_group.result[count].box_conf = box_conf;
 
-        const char *label_temp = labels[id].c_str();
-        // 将类别名称复制到检测结果组中
-        strncpy(result_group.result[count].label, label_temp, 32);
+        const std::string fallback = "class_" + std::to_string(id);
+        const std::string& label =
+            (id >= 0 && static_cast<size_t>(id) < labels.size())
+                ? labels[static_cast<size_t>(id)]
+                : fallback;
+        // snprintf 会确保 label 缓冲区以 NUL 结尾。
+        snprintf(result_group.result[count].label,
+                 sizeof(result_group.result[count].label),
+                 "%s",
+                 label.c_str());
 
         // printf("%s\n", labels[id].c_str());
         count++;

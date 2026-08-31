@@ -40,6 +40,7 @@ void ThreadPoll::init(const char* model_path, int num_threads)
     {
         auto yolo = std::make_shared<Yolov5s>(model_path, i % 3);
         yolo_group.emplace_back(yolo);
+        yolo_mutexes.emplace_back(std::make_shared<std::mutex>());
     }
 
     // 启动 num_threads 个工作线程
@@ -81,7 +82,6 @@ void ThreadPoll::worker(int id)
         // 离开大锁区后执行真正的推理任务
         if(current_task.valid())
         {
-            printf("worker %d get task！\r\n", id); // 获取任务
             // 如果任务有效，就调用 operator() 执行
             current_task();
         }
@@ -102,9 +102,9 @@ std::future<ProcessResult> ThreadPoll::submit_task_async(int index, cv::Mat img)
         {
             // 从 yolo_group 里选一个做推理，这里简单选 index % yolo_group.size()
             // 你也可以做负载均衡
-            auto yolo = yolo_group[index % yolo_group.size()];
-
-            printf("worker get task %d！\r\n", index); // 获取任务
+            const size_t model_index = static_cast<size_t>(index) % yolo_group.size();
+            auto yolo = yolo_group[model_index];
+            std::lock_guard<std::mutex> model_lock(*yolo_mutexes[model_index]);
 
             // 推理
             detect_result_group_t detections;
@@ -132,7 +132,6 @@ std::future<ProcessResult> ThreadPoll::submit_task_async(int index, cv::Mat img)
 
         // 把打包好的任务放到队列
         tasks.emplace(std::move(task));
-        std::cout << "[submit_task_async] 已压入tasks队列, 现在大小=" << tasks.size() << std::endl;
     }
     // 3) 唤醒一个worker线程来执行
     condition.notify_one();
