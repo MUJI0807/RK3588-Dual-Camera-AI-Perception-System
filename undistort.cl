@@ -17,21 +17,20 @@ inline float4 sample_bilinear(__read_only image2d_t input_img,
                               int width, int height,
                               sampler_t sampler)
 {
-    // 边界检查：如果坐标超出图像范围，返回黑色
-    if (x < 0.0f || x >= (float)(width - 1) ||
-        y < 0.0f || y >= (float)(height - 1)) {
-        return (float4)(0.0f, 0.0f, 0.0f, 0.0f);
-    }
+    // 边界处理：将采样坐标钳制到图像有效范围内（等价 CLK_ADDRESS_CLAMP_TO_EDGE）。
+    // 原来的实现越界直接返回黑色，导致去畸变后图像四周出现黑色边框。
+    float sx = clamp(x, 0.0f, (float)(width - 1));
+    float sy = clamp(y, 0.0f, (float)(height - 1));
 
-    // 取整得到四个相邻像素坐标
-    int x0 = (int)x;
-    int y0 = (int)y;
-    int x1 = x0 + 1;
-    int y1 = y0 + 1;
+    // 取整得到四个相邻像素坐标（x1/y1 也钳制，避免越界读）
+    int x0 = (int)sx;
+    int y0 = (int)sy;
+    int x1 = min(x0 + 1, width - 1);
+    int y1 = min(y0 + 1, height - 1);
 
     // 计算小数部分（权重）
-    float dx = x - (float)x0;
-    float dy = y - (float)y0;
+    float dx = sx - (float)x0;
+    float dy = sy - (float)y0;
 
     // 读取四个相邻像素
     float4 p00 = read_imagef(input_img, sampler, (int2)(x0, y0));

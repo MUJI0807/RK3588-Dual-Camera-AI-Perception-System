@@ -761,7 +761,16 @@ void inference_and_compositor_thread(
                 continue;
             }
 
-            ProcessResult result = iterator->future.get();
+            ProcessResult result;
+            try {
+                result = iterator->future.get();
+            } catch (const std::exception& error) {
+                result.success = false;
+                result.error_msg = error.what();
+            } catch (...) {
+                result.success = false;
+                result.error_msg = "unknown exception from NPU worker";
+            }
             const int camera_id = iterator->camera_id;
             if (result.success && !result.processed_img.empty() &&
                 (!have_frame[camera_id] || iterator->sequence >= latest_sequence[camera_id])) {
@@ -843,6 +852,18 @@ int parse_positive_int(const char* text, int fallback)
     }
 }
 
+// 解析运行时长（秒）：允许 0 表示无限运行；负数/非法值回退到 fallback。
+int parse_run_seconds(const char* text, int fallback)
+{
+    if (!text) return fallback;
+    try {
+        const int value = std::stoi(text);
+        return value >= 0 ? value : fallback;
+    } catch (...) {
+        return fallback;
+    }
+}
+
 std::string default_model_path_from_executable()
 {
     std::array<char, 4096> executable_path{};
@@ -874,6 +895,8 @@ int main(int argc, char** argv)
     const std::string model_path = argc > 7
         ? argv[7]
         : default_model_path_from_executable();
+    // 运行时长（秒）：0 表示无限运行；默认 300 秒（兼容原行为）。
+    const int run_seconds = argc > 8 ? parse_run_seconds(argv[8], 300) : 300;
 
     if (::access(model_path.c_str(), R_OK) != 0) {
         std::cerr << "[Main] RKNN model is not readable: " << model_path << '\n';
@@ -967,8 +990,8 @@ int main(int argc, char** argv)
     while (!g_stop.load()) {
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start);
-        if (elapsed.count() >= 300) {
-            std::cerr << "[Main] 300 seconds reached; stopping\n";
+        if (run_seconds > 0 && elapsed.count() >= run_seconds) {
+            std::cerr << "[Main] " << run_seconds << " seconds reached; stopping\n";
             g_stop = true;
             break;
         }

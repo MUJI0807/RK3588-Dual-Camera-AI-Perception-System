@@ -15,6 +15,27 @@ static int64_t last_pts_ms = AV_NOPTS_VALUE;
 static int64_t nominal_frame_duration_ms = 33;
 
 /*
+ * 从 MPP 输出的 H.264 码流中解析 NALU 类型（跳过 start code）。
+ * 返回 NALU 类型（1~12），无法识别返回 -1。
+ * 用于正确设置 AVPacket 的 AV_PKT_FLAG_KEY：只有 IDR 帧（5）才真正
+ * 是关键帧；SPS(7)/PPS(8) 属于序列头。把所有帧都标记为关键帧会导致
+ * 播放端把 P 帧当 I 帧解码，出现花屏/卡顿。
+ */
+static int find_nalu_type(const uint8_t *data, int size)
+{
+    int offset = 0;
+    if (data == NULL || size <= 0) return -1;
+    if (size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        offset = 4;
+    else if (size >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1)
+        offset = 3;
+    else
+        return -1;
+    if (size <= offset) return -1;
+    return data[offset] & 0x1f;
+}
+
+/*
  * 发送一帧编码码流到 RTMP 输出（通过 FFmpeg muxer）
  * 将编码器输出的 H.264/H.265 码流数据封装为 AVPacket，
  * 设置时间戳（PTS/DTS）与持续时长，然后调用 av_write_frame()
@@ -42,7 +63,15 @@ int write_frame(uint8_t*data,int size)
 
         pkt.size = size;      //设置 AVPacket 的数据长度
         pkt.data = data;      //设置 AVPacket 的数据指针
-        pkt.flags = 0x01;     // 设置 AVPacket 的数据指针, 要求：data 指向的内存在 av_write_frame 调用期间必须保持有效
+        // 关键帧标志必须按 NALU 类型设置：只有 IDR(5)/SPS(7)/PPS(8) 是关键帧相关，
+        // 全部标 0x01 会把 P 帧当关键帧，导致播放端花屏。
+        pkt.flags = 0;
+        {
+            const int nalu = find_nalu_type(data, size);
+            if (nalu == 5 || nalu == 7 || nalu == 8) {
+                pkt.flags = AV_PKT_FLAG_KEY;
+            }
+        }
         pkt.stream_index = 0; // 设置 AVPacket 标志位
         pkt.pts = pts;        // 设置 AVPacket 的显示时间戳
         pkt.dts = pts;        // 无 B 帧时 DTS 与 PTS 相同
@@ -148,7 +177,9 @@ int init_rtmp_streamer(char* stream, RtmpContext *config)
 
         printf("打开RTMP URL %s\n", stream);
         if (!(ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {  // 如果输出格式不包含 AVFMT_NOFILE 标志
+                // 限制重试次数：RTMP 服务器不可达时不能无限阻塞（否则主线程永久挂起）。
                 int retry_count = 0;
+                const int max_retries = 3;
                 while (1) {
                         ret = avio_open(&ofmt_ctx->pb, stream, AVIO_FLAG_WRITE);  // 打开RTMP输出URL进行写入
                         // &ofmt_ctx->pb是输出格式上下文的IO上下文指针, stream是RTMP服务器地址, AVIO_FLAG_WRITE表示以写入模式打开
@@ -157,6 +188,10 @@ int init_rtmp_streamer(char* stream, RtmpContext *config)
                         }
                         retry_count++;  // 连接失败，增加重试计数
                         printf("无法连接到RTMP服务器 '%s'，5秒后重试... (第%d次尝试)\n", stream, retry_count);
+                        if (retry_count >= max_retries) {
+                                fprintf(stderr, "RTMP服务器连接失败，已重试 %d 次，放弃初始化\n", max_retries);
+                                goto end;   // 跳转到清理代码
+                        }
                         sleep(5);
                 }
         }
@@ -170,6 +205,7 @@ int init_rtmp_streamer(char* stream, RtmpContext *config)
         printf("写入文件头成功\n");
 
         avcodec_free_context(&o_codec_ctx);
+        o_codec_ctx = NULL;
 
         printf("创建输出流成功\n");
         printf("创建编码器上下文成功\n");
@@ -181,9 +217,22 @@ int init_rtmp_streamer(char* stream, RtmpContext *config)
         return 0;
 
         end: // 清理代码
-        if (ofmt_ctx && !(ofmt_ctx->oformat->flags & AVFMT_NOFILE)) // 如果输出格式上下文存在且不包含 AVFMT_NOFILE 标志
-                avio_close(ofmt_ctx->pb); // 关闭IO上下文
-        avformat_free_context(ofmt_ctx);  // 释放输出格式上下文
+        // 失败路径释放编码器上下文（成功路径已在上面释放并置 NULL，这里判空保护）
+        if (o_codec_ctx) {
+                avcodec_free_context(&o_codec_ctx);
+                o_codec_ctx = NULL;
+        }
+        if (ofmt_ctx && !(ofmt_ctx->oformat->flags & AVFMT_NOFILE)) { // 如果输出格式上下文存在且不包含 AVFMT_NOFILE 标志
+                // avio_open 失败时 pb 可能为 NULL，avio_close(NULL) 会崩溃，必须判空
+                if (ofmt_ctx->pb) {
+                        avio_close(ofmt_ctx->pb); // 关闭IO上下文
+                        ofmt_ctx->pb = NULL;
+                }
+        }
+        if (ofmt_ctx) {
+                avformat_free_context(ofmt_ctx);  // 释放输出格式上下文
+                ofmt_ctx = NULL;
+        }
         if (ret < 0 && ret != AVERROR_EOF) {  // 如果发生错误且不是文件结束错误
                 printf( "Error occurred.\n");  
                 printf("初始化失败，开始清理资源...\n");

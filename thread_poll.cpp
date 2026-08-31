@@ -1,4 +1,4 @@
-﻿#include "thread_poll.h"
+#include "thread_poll.h"
 
 ThreadPoll::ThreadPoll(const char* model_path, int num_threads)
 {
@@ -11,7 +11,11 @@ ThreadPoll::ThreadPoll(const char* model_path, int num_threads)
 ThreadPoll::~ThreadPoll()
 {
     // 在ThreadPoll析构函数添加
-    std::cout << "Remaining tasks: " << tasks.size() << std::endl;
+    // 修复：tasks 会被 worker 线程并发 pop，读取 size 必须先加锁，否则是数据竞争
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        std::cout << "Remaining tasks: " << tasks.size() << std::endl;
+    }
 
     // 通知线程退出
     run_flag = false;
@@ -87,7 +91,10 @@ void ThreadPoll::worker(int id)
         }
     }
     // 在worker线程退出时添加
-    std::cout << "Worker " << id << " exited, remaining tasks: " << tasks.size() << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        std::cout << "Worker " << id << " exited, remaining tasks: " << tasks.size() << std::endl;
+    }
 }
 
 // 新的方法：往 tasks 里塞任务，并用 std::future<ProcessResult> 返回结果

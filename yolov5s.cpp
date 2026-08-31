@@ -1,4 +1,4 @@
-﻿#include "yolov5s.h"
+#include "yolov5s.h"
 #include "post_process.h"
 #include "lane_detector.h"
 #include "unet_lane_detector.h"
@@ -12,6 +12,8 @@
 #include <deque>
 #include <string>
 #include <cctype>
+#include <mutex>
+#include <stdexcept>
 
 
 using namespace std;
@@ -27,11 +29,21 @@ static LaneDetector g_lane_detector;
 static UNetLaneDetector g_unet_lane;
 static bool g_unet_lane_try_init = false;
 
+// 3 个 NPU worker 线程会并发调用 draw_driving_assist（各自持有独立的 Yolov5s
+// 实例，但共享下面的文件级全局车道线/UNet/引导状态）。不加锁会产生数据竞争，
+// 导致车道线/引导状态错乱甚至崩溃。此处将整个绘制段串行化：推理仍并行，
+// 只有视觉绘制部分互斥，对吞吐影响很小。
+static std::mutex g_assist_mutex;
+
 static void print_tensor_attr(rknn_tensor_attr *attr)
 {
+    if (!attr) return;
     string shape_str = attr->n_dims < 1 ? "" : to_string(attr->dims[0]);
     for (int i = 1; i < attr->n_dims; i++)
         shape_str += "," + to_string(attr->dims[i]);
+    printf("  tensor index=%u dims=[%s] n_elems=%u size=%u fmt=%d type=%d\n",
+           attr->index, shape_str.c_str(), attr->n_elems, attr->size,
+           (int)attr->fmt, (int)attr->type);
 }
 
 // ============================================================================
@@ -1736,6 +1748,11 @@ static void draw_driving_assist(Mat &img, detect_result_group_t &result_group)
 {
     if (img.empty()) return;
 
+    // 串行化车道线绘制段：共享全局状态（g_unet_lane / g_lane_detector /
+    // g_smooth_* / g_last_bev_lane / g_candidate 等）由 3 个 NPU worker
+    // 并发访问，必须互斥。推理本身仍在锁外并行执行。
+    std::lock_guard<std::mutex> assist_lock(g_assist_mutex);
+
     // 1) 获取车辆遮罩，避免车辆框内部的反光、车牌、白色车身影响车道显示。
     Mat vehicle_mask = build_vehicle_mask(img, result_group);
 
@@ -1791,10 +1808,18 @@ Yolov5s::Yolov5s(const char* model_path, int npu_index)
 {
     int ret;
     model_data = load_model(model_path, this->model_size);
+    if (!model_data) {
+        throw std::runtime_error(std::string("failed to load RKNN model: ") + model_path);
+    }
     ret = rknn_init(&this->context, model_data, this->model_size, RKNN_FLAG_PRIOR_HIGH, NULL);
 
-    if (ret != 0) printf("rknn init failed! %d\n", ret);
-    else          printf("yolo %d init ok\n", npu_index);
+    if (ret != 0) {
+        printf("rknn init failed! %d\n", ret);
+        free(model_data);
+        model_data = nullptr;
+        throw std::runtime_error(std::string("rknn_init failed: ") + std::to_string(ret));
+    }
+    printf("yolo %d init ok\n", npu_index);
 
     if      (npu_index % 4 == 0) ret = rknn_set_core_mask(context, RKNN_NPU_CORE_0);
     else if (npu_index % 4 == 1) ret = rknn_set_core_mask(context, RKNN_NPU_CORE_1);
@@ -1880,6 +1905,11 @@ unsigned char *Yolov5s::load_model(const char* model_path, unsigned int &model_s
 int Yolov5s::inference_image(Mat &orig_img, detect_result_group_t &result_group)
 {
     int ret = 0;
+
+    // 记录原始图像尺寸：16 对齐补齐后模型坐标系与原图坐标系不一致，
+    // 必须在绘制前把检测框映射回原图坐标，否则框会整体偏移。
+    const int orig_w = orig_img.cols;
+    const int orig_h = orig_img.rows;
 
     this->img_height = orig_img.rows;
     this->img_width  = orig_img.cols;
@@ -2028,6 +2058,19 @@ int Yolov5s::inference_image(Mat &orig_img, detect_result_group_t &result_group)
                  qzps,
                  qscales,
                  result_group);
+
+    // 16 对齐补齐场景：post_process 的坐标基于补齐后尺寸 (img_width x img_height)，
+    // 必须缩回原始图像尺寸，否则检测框和车道线绘制会偏移（例如 1920x1080 摄像头）。
+    if (img_width != orig_w || img_height != orig_h) {
+        const float sx = static_cast<float>(orig_w) / static_cast<float>(img_width);
+        const float sy = static_cast<float>(orig_h) / static_cast<float>(img_height);
+        for (int i = 0; i < result_group.box_count; ++i) {
+            result_group.result[i].box.xmin = static_cast<int>(result_group.result[i].box.xmin * sx);
+            result_group.result[i].box.ymin = static_cast<int>(result_group.result[i].box.ymin * sy);
+            result_group.result[i].box.xmax = static_cast<int>(result_group.result[i].box.xmax * sx);
+            result_group.result[i].box.ymax = static_cast<int>(result_group.result[i].box.ymax * sy);
+        }
+    }
 
     draw_result(orig_img, result_group);
 

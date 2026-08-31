@@ -585,6 +585,8 @@ static _Bool process_image(uint8_t *p, int size, MppContext *mpp_enc_data)
     ret = mpp_packet_init_with_buffer(&packet, mpp_enc_data->pkt_buf);
     if (ret || !packet) {
         printf("mpp_packet_init_with_buffer failed ret=%d\n", ret);
+        // 防御：ret 失败但 packet 可能已分配，需释放避免泄漏
+        if (packet) mpp_packet_deinit(&packet);
         mpp_frame_deinit(&frame);
         return 1;
     }

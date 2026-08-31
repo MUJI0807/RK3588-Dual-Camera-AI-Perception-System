@@ -63,7 +63,11 @@ int init_streamer(int width, int height, int fps, int bitrate, const char *rtmp_
     int ret = g_streamer_ctx.mpp_ctx->init_mpp(g_streamer_ctx.mpp_ctx); // 真正创建 MPP ctx/mpi/buf/cfg 等
     if(ret != 0) {                              // ret!=0 表示失败（你 mpp.c 的 init_mpp 返回 ret）
         printf("mpp init fail!\n");
-        // ⚠️ 风险：这里失败并没有 return -1，也没有释放 g_streamer_ctx.mpp_ctx，后续还会继续走
+        // 修复：失败必须立即返回并释放上下文，否则后续 get_header/process_image
+        // 会在未初始化的编码器上调用，导致崩溃或非法码流。
+        g_streamer_ctx.mpp_ctx->close(g_streamer_ctx.mpp_ctx);
+        g_streamer_ctx.mpp_ctx = NULL;
+        return -1;
     } else {
         printf("mpp init success!\n");
     }
@@ -72,6 +76,8 @@ int init_streamer(int width, int height, int fps, int bitrate, const char *rtmp_
     if (!g_streamer_ctx.mpp_ctx->get_header(g_streamer_ctx.mpp_ctx, &g_streamer_ctx.sps_header)) {
         // get_header 返回 false 表示失败
         printf("Failed to get SPS/PPS header\n");
+        g_streamer_ctx.mpp_ctx->close(g_streamer_ctx.mpp_ctx);
+        g_streamer_ctx.mpp_ctx = NULL;
         return -1;
     }
     
@@ -100,6 +106,20 @@ int init_streamer(int width, int height, int fps, int bitrate, const char *rtmp_
     if (init_rtmp_streamer((char*)rtmp_url, g_streamer_ctx.rtmp_ctx) < 0) {
         // init_rtmp_streamer 内部会 avformat_alloc_output_context2/avio_open/avformat_write_header 等
         printf("Failed to initialize RTMP streamer\n");
+        // 修复：失败路径统一清理，避免 mpp_ctx / sps_header / rtmp_ctx 泄漏
+        if (g_streamer_ctx.mpp_ctx) {
+            g_streamer_ctx.mpp_ctx->close(g_streamer_ctx.mpp_ctx);
+            g_streamer_ctx.mpp_ctx = NULL;
+        }
+        if (g_streamer_ctx.sps_header.data) {
+            free(g_streamer_ctx.sps_header.data);
+            g_streamer_ctx.sps_header.data = NULL;
+            g_streamer_ctx.sps_header.size = 0;
+        }
+        if (g_streamer_ctx.rtmp_ctx) {
+            free(g_streamer_ctx.rtmp_ctx);
+            g_streamer_ctx.rtmp_ctx = NULL;
+        }
         return -1;
     }
     printf("初始化RTMP成功\n");

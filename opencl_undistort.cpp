@@ -19,12 +19,13 @@
 // OpenCL 内核源代码文件路径
 static const char* KERNEL_FILE_PATH = "undistort.cl";
 
-// 辅助宏：检查 OpenCL 错误
+// 辅助宏：检查 OpenCL 错误。失败时跳转到本函数的 fail 标签统一清理，
+// 避免初始化中途失败时泄漏已创建的 context/queue/program 等资源。
 #define CL_CHECK(err) \
     do { \
         if ((err) != CL_SUCCESS) { \
             std::cerr << "[OpenCL] Error " << (err) << " at " << __FILE__ << ":" << __LINE__ << '\n'; \
-            return false; \
+            goto fail; \
         } \
     } while (0)
 
@@ -62,6 +63,11 @@ bool OpenCLUndistortContext::initialize(const CameraCalibration& calibration,
 
     cl_int err = CL_SUCCESS;
 
+    // 注意：以下容器必须声明在第一个 CL_CHECK 之前。
+    // CL_CHECK 失败会 goto fail，若声明在 goto 之后，C++ 禁止跳越非平凡变量的初始化。
+    std::vector<cl_platform_id> platforms;
+    std::vector<cl_device_id> devices;
+
     // 步骤 1：获取平台列表
     cl_uint num_platforms = 0;
     err = clGetPlatformIDs(0, nullptr, &num_platforms);
@@ -71,7 +77,7 @@ bool OpenCLUndistortContext::initialize(const CameraCalibration& calibration,
         return false;
     }
 
-    std::vector<cl_platform_id> platforms(num_platforms);
+    platforms.resize(num_platforms);
     err = clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
     CL_CHECK(err);
 
@@ -108,7 +114,7 @@ bool OpenCLUndistortContext::initialize(const CameraCalibration& calibration,
         return false;
     }
 
-    std::vector<cl_device_id> devices(num_devices);
+    devices.resize(num_devices);
     err = clGetDeviceIDs(platform_, CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr);
     CL_CHECK(err);
 
@@ -131,7 +137,7 @@ bool OpenCLUndistortContext::initialize(const CameraCalibration& calibration,
 
     // 步骤 6：加载并编译内核程序
     if (!load_kernel_program()) {
-        return false;
+        goto fail;
     }
 
     // 步骤 7：创建内核
@@ -140,12 +146,17 @@ bool OpenCLUndistortContext::initialize(const CameraCalibration& calibration,
 
     // 步骤 8：创建图像缓冲区
     if (!create_image_buffers()) {
-        return false;
+        goto fail;
     }
 
     initialized_ = true;
     std::cout << "[OpenCL] Initialization complete (" << width << "x" << height << ")\n";
     return true;
+
+fail:
+    // 统一清理：release() 对每个资源指针判空释放，可安全重复调用
+    release();
+    return false;
 }
 
 bool OpenCLUndistortContext::load_kernel_program()
@@ -183,10 +194,17 @@ bool OpenCLUndistortContext::load_kernel_program()
         clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG,
                               log_length, log.data(), nullptr);
         std::cerr << "[OpenCL] Build log:\n" << log.data() << '\n';
-        return false;
+        goto fail;
     }
 
     return true;
+
+fail:
+    if (program_) {
+        clReleaseProgram(program_);
+        program_ = nullptr;
+    }
+    return false;
 }
 
 bool OpenCLUndistortContext::create_image_buffers()
@@ -218,6 +236,17 @@ bool OpenCLUndistortContext::create_image_buffers()
     CL_CHECK(err);
 
     return true;
+
+fail:
+    if (input_image_) {
+        clReleaseMemObject(input_image_);
+        input_image_ = nullptr;
+    }
+    if (output_image_) {
+        clReleaseMemObject(output_image_);
+        output_image_ = nullptr;
+    }
+    return false;
 }
 
 bool OpenCLUndistortContext::undistort(const cv::Mat& input_bgr, cv::Mat& output_bgr)
@@ -234,8 +263,12 @@ bool OpenCLUndistortContext::undistort(const cv::Mat& input_bgr, cv::Mat& output
 
     cl_int err = CL_SUCCESS;
 
-    // 步骤 1：将 BGR 转换为 RGBA（OpenCL 图像格式要求）
+    // 输出缓冲也必须在 CL_CHECK 之前声明：失败路径 goto fail 时
+    // C++ 不允许跳越带析构的局部变量初始化。
     cv::Mat rgba;
+    cv::Mat rgba_output;
+
+    // 步骤 1：将 BGR 转换为 RGBA（OpenCL 图像格式要求）
     cv::cvtColor(input_bgr, rgba, cv::COLOR_BGR2RGBA);
 
     // 步骤 2：将输入图像数据写入 OpenCL 图像对象
@@ -275,12 +308,9 @@ bool OpenCLUndistortContext::undistort(const cv::Mat& input_bgr, cv::Mat& output
                                  0, nullptr, nullptr);
     CL_CHECK(err);
 
-    // 步骤 5：等待内核执行完成
-    err = clFinish(queue_);
-    CL_CHECK(err);
-
-    // 步骤 6：从 OpenCL 图像对象读取输出数据
-    cv::Mat rgba_output(height_, width_, CV_8UC4);
+    // 步骤 6：从 OpenCL 图像对象读取输出数据（CL_TRUE 阻塞读已隐含同步，
+    // 无需单独的 clFinish，减少一次全管线同步开销）
+    rgba_output.create(height_, width_, CV_8UC4);
     err = clEnqueueReadImage(queue_, output_image_, CL_TRUE,
                              origin, region,
                              rgba_output.step[0], 0,
@@ -292,25 +322,22 @@ bool OpenCLUndistortContext::undistort(const cv::Mat& input_bgr, cv::Mat& output
     cv::cvtColor(rgba_output, output_bgr, cv::COLOR_RGBA2BGR);
 
     return true;
+
+fail:
+    return false;
 }
 
 void OpenCLUndistortContext::release()
 {
-    if (!initialized_) return;
-
-    if (input_image_) clReleaseMemObject(input_image_);
-    if (output_image_) clReleaseMemObject(output_image_);
-    if (kernel_) clReleaseKernel(kernel_);
-    if (program_) clReleaseProgram(program_);
-    if (queue_) clReleaseCommandQueue(queue_);
-    if (context_) clReleaseContext(context_);
-
-    input_image_ = nullptr;
-    output_image_ = nullptr;
-    kernel_ = nullptr;
-    program_ = nullptr;
-    queue_ = nullptr;
-    context_ = nullptr;
+    // 修复：不能依赖 initialized_ 标志。initialize() 中途失败（如内核编译失败）
+    // 时 initialized_ 仍为 false，但 context/queue/program 等可能已经创建，
+    // 直接 return 会资源泄漏。这里对每个资源指针逐个判空释放。
+    if (input_image_) { clReleaseMemObject(input_image_); input_image_ = nullptr; }
+    if (output_image_) { clReleaseMemObject(output_image_); output_image_ = nullptr; }
+    if (kernel_) { clReleaseKernel(kernel_); kernel_ = nullptr; }
+    if (program_) { clReleaseProgram(program_); program_ = nullptr; }
+    if (queue_) { clReleaseCommandQueue(queue_); queue_ = nullptr; }
+    if (context_) { clReleaseContext(context_); context_ = nullptr; }
 
     initialized_ = false;
     std::cout << "[OpenCL] Resources released\n";
