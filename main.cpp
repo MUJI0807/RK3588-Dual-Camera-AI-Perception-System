@@ -639,24 +639,86 @@ std::vector<uint32_t> usb_format_preferences()
     return formats;
 }
 
-void read_thread(V4L2Camera& camera, int camera_id)
+// ============================================================================
+//  帧源抽象：让 read_thread 既能读 V4L2 摄像头，也能读视频文件（调试用）
+//  调试时用视频文件模拟摄像头输入（如 input1.mp4），无需真实摄像头。
+// ============================================================================
+struct IFrameSource {
+    virtual ~IFrameSource() = default;
+    virtual bool read_bgr(cv::Mat& out, int timeout_ms) = 0;
+    virtual int width() const = 0;
+    virtual int height() const = 0;
+    virtual int fps() const = 0;
+    virtual std::string name() const = 0;
+};
+
+// V4L2 摄像头帧源（适配现有 V4L2Camera）
+struct V4L2Source : IFrameSource {
+    V4L2Camera* cam = nullptr;
+    explicit V4L2Source(V4L2Camera* c) : cam(c) {}
+    bool read_bgr(cv::Mat& out, int timeout_ms) override {
+        return cam->read_frame_bgr(out, timeout_ms);
+    }
+    int width() const override { return cam->width(); }
+    int height() const override { return cam->height(); }
+    int fps() const override { return cam->fps(); }
+    std::string name() const override { return cam->device_name(); }
+};
+
+// 视频文件帧源（cv::VideoCapture 读文件，播完自动循环）
+struct VideoSource : IFrameSource {
+    cv::VideoCapture cap;
+    std::string path_;
+    int w_ = 0, h_ = 0, fps_ = 30;
+
+    bool open(const std::string& path) {
+        path_ = path;
+        if (!cap.open(path)) return false;
+        w_ = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+        h_ = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+        const double f = cap.get(cv::CAP_PROP_FPS);
+        if (f > 1.0) fps_ = static_cast<int>(f);
+        return w_ > 0 && h_ > 0;
+    }
+    bool read_bgr(cv::Mat& out, int) override {
+        if (!cap.read(out) || out.empty()) {
+            // 播完循环重播
+            cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+            if (!cap.read(out) || out.empty()) return false;
+        }
+        return true;
+    }
+    int width() const override { return w_; }
+    int height() const override { return h_; }
+    int fps() const override { return fps_; }
+    std::string name() const override { return path_; }
+};
+
+// 判断参数是"视频文件"还是"摄像头设备"：非 /dev/ 且文件可读 → 视频文件
+bool is_video_source(const std::string& s)
+{
+    if (s.find("/dev/") != std::string::npos) return false;
+    return ::access(s.c_str(), R_OK) == 0;
+}
+
+void read_thread(IFrameSource& source, int camera_id, bool do_undistort)
 {
     uint64_t sequence = 0;
     uint64_t dropped = 0;
 
     while (!g_stop.load()) {
         cv::Mat bgr;
-        if (!camera.read_frame_bgr(bgr, 1000)) continue;
+        if (!source.read_bgr(bgr, 1000)) continue;
         g_capture_frames[camera_id].fetch_add(1, std::memory_order_relaxed);
 
-        // 对 MIPI 摄像头执行 OpenCL 去畸变（如果已初始化）
-        if (camera_id == 0 && g_undistort_context != nullptr) {
+        // 仅对"真实 MIPI 摄像头"执行 OpenCL 去畸变（视频源已校正，跳过）
+        if (do_undistort && camera_id == 0 && g_undistort_context != nullptr) {
             cv::Mat undistorted;
             if (g_undistort_context->undistort(bgr, undistorted)) {
                 bgr = std::move(undistorted);
             } else {
                 std::cerr << "[Undistort] Failed on frame from "
-                          << camera.device_name() << '\n';
+                          << source.name() << '\n';
             }
         }
 
@@ -675,7 +737,7 @@ void read_thread(V4L2Camera& camera, int camera_id)
     if (g_active_readers.fetch_sub(1) == 1) {
         g_read_finish = true;
     }
-    std::cerr << "[Capture " << camera.device_name() << "] stopped\n";
+    std::cerr << "[Capture " << source.name() << "] stopped\n";
 }
 
 cv::Mat fit_into_tile(const cv::Mat& source, int tile_width, int tile_height)
@@ -903,22 +965,54 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    // 帧源选择：视频文件（调试用）或 V4L2 摄像头（真实采集）。
+    // 当命令行参数是"可读文件且非 /dev/ 设备"时，按视频文件回放处理，
+    // 方便在没有摄像头时用 input1.mp4 等视频验证识别/推流效果。
     std::array<V4L2Camera, kCameraCount> cameras;
-    if (!cameras[0].open_device(mipi_device,
-                                capture_width,
-                                capture_height,
-                                fallback_fps,
-                                mipi_format_preferences())) {
-        std::cerr << "[Main] failed to open MIPI camera " << mipi_device << '\n';
-        return EXIT_FAILURE;
+    VideoSource video_sources[kCameraCount];
+    V4L2Source v4l2_src0(&cameras[0]);
+    V4L2Source v4l2_src1(&cameras[1]);
+    IFrameSource* sources[kCameraCount] = {nullptr, nullptr};
+    bool use_video[kCameraCount] = {false, false};
+
+    // ---- camera 0（MIPI 路） ----
+    if (is_video_source(mipi_device)) {
+        if (!video_sources[0].open(mipi_device)) {
+            std::cerr << "[Main] failed to open video " << mipi_device << '\n';
+            return EXIT_FAILURE;
+        }
+        sources[0] = &video_sources[0];
+        use_video[0] = true;
+    } else {
+        if (!cameras[0].open_device(mipi_device,
+                                    capture_width,
+                                    capture_height,
+                                    fallback_fps,
+                                    mipi_format_preferences())) {
+            std::cerr << "[Main] failed to open MIPI camera " << mipi_device << '\n';
+            return EXIT_FAILURE;
+        }
+        sources[0] = &v4l2_src0;
     }
-    if (!cameras[1].open_device(usb_device,
-                                capture_width,
-                                capture_height,
-                                fallback_fps,
-                                usb_format_preferences())) {
-        std::cerr << "[Main] failed to open USB camera " << usb_device << '\n';
-        return EXIT_FAILURE;
+
+    // ---- camera 1（USB 路） ----
+    if (is_video_source(usb_device)) {
+        if (!video_sources[1].open(usb_device)) {
+            std::cerr << "[Main] failed to open video " << usb_device << '\n';
+            return EXIT_FAILURE;
+        }
+        sources[1] = &video_sources[1];
+        use_video[1] = true;
+    } else {
+        if (!cameras[1].open_device(usb_device,
+                                    capture_width,
+                                    capture_height,
+                                    fallback_fps,
+                                    usb_format_preferences())) {
+            std::cerr << "[Main] failed to open USB camera " << usb_device << '\n';
+            return EXIT_FAILURE;
+        }
+        sources[1] = &v4l2_src1;
     }
 
     // FFmpeg/RTMP 最终只输出一帧 1280x720：左右各一个 640x720 区域。
@@ -929,23 +1023,23 @@ int main(int argc, char** argv)
     const int tile_width = g_output_width / kCameraCount;
     const int tile_height = g_output_height;
 
-    // 初始化 OpenCL 去畸变模块（仅用于 MIPI 摄像头）
+    // 初始化 OpenCL 去畸变模块（仅用于"真实 MIPI 摄像头"，视频源跳过）
     // 使用模拟标定参数，后续可替换为真实标定结果
     CameraCalibration calibration;
     g_undistort_context = new OpenCLUndistortContext();
     if (!g_undistort_context->initialize(calibration,
-                                         cameras[0].width(),
-                                         cameras[0].height())) {
+                                         sources[0]->width(),
+                                         sources[0]->height())) {
         std::cerr << "[Main] OpenCL undistortion initialization failed, "
                   << "continuing without undistortion\n";
         delete g_undistort_context;
         g_undistort_context = nullptr;
     }
 
-    // 使用两路摄像头报告值中较低的一路作为编码器参考帧率。
+    // 使用两路帧源报告值中较低的一路作为编码器参考帧率。
     // 实际 RTMP PTS/DTS 由单调时钟生成，可以接受可变间隔。
     const int stream_fps = std::max(1,
-        std::min(cameras[0].fps(), cameras[1].fps()));
+        std::min(sources[0]->fps(), sources[1]->fps()));
 
     std::unique_ptr<ThreadPoll> npu_pool;
     try {
@@ -966,13 +1060,14 @@ int main(int argc, char** argv)
     }
 
     const std::array<std::string, kCameraCount> labels = {{
-        "MIPI " + mipi_device,
-        "USB " + usb_device
+        (use_video[0] ? "VIDEO " : "MIPI ") + sources[0]->name(),
+        (use_video[1] ? "VIDEO " : "USB ") + sources[1]->name()
     }};
 
     g_active_readers = kCameraCount;
-    std::thread mipi_reader(read_thread, std::ref(cameras[0]), 0);
-    std::thread usb_reader(read_thread, std::ref(cameras[1]), 1);
+    // 仅真实 MIPI 摄像头执行去畸变（camera0 且非视频源）；USB 路从不去畸变
+    std::thread mipi_reader(read_thread, std::ref(*sources[0]), 0, !use_video[0]);
+    std::thread usb_reader(read_thread, std::ref(*sources[1]), 1, false);
     std::thread compositor(inference_and_compositor_thread,
                            std::ref(*npu_pool),
                            std::cref(labels),
