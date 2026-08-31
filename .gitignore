@@ -48,4 +48,5 @@ Thumbs.db
 
 # 鍏朵粬
 *.bak
-*.backup
+*.backup# 第三方MPP源码（独立仓库，不纳入版本管理）
+mpp/mpp/
