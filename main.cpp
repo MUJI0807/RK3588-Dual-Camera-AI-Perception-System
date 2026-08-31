@@ -35,6 +35,7 @@
 #include "rga.h"
 
 #include "opencl_undistort.h"
+#include "qwen_analyzer.h"
 
 #define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define ALIGN64(x) ALIGN(x, 64)
@@ -73,6 +74,79 @@ struct FrameData {
 
 SafeQueue<FrameData> g_read_queue(kReadQueueCapacity);
 SafeQueue<FrameData> g_write_queue(kWriteQueueCapacity);
+
+#ifdef QWEN_ENABLED
+// ============================================================================
+//  Qwen3-VL 旁路风险分析（仅在 QWEN_ENABLED 下编译）
+//  - 独立线程串行推理（RKLLM 单实例不可并发）
+//  - "最新帧优先"单槽：Qwen 推理慢（单帧秒级），只保留最新一帧，旧的直接覆盖
+//  - 事件驱动 + 定时调度：在 compositor 合成后触发投喂
+// ============================================================================
+QwenAnalyzer g_qwen;
+std::atomic<bool> g_qwen_stop{false};
+
+struct QwenSlot {
+    std::mutex m;
+    cv::Mat frame;
+    std::string detection_context;
+    bool has = false;
+};
+QwenSlot g_qwen_slot;
+
+// 把一路检测结果文本化，作为注入给 Qwen 的底层感知上下文
+std::string detection_group_to_text(const detect_result_group_t& group, const char* camera_name)
+{
+    std::string out;
+    for (int i = 0; i < group.box_count; ++i) {
+        const detect_result_t& r = group.result[i];
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "%s %s conf=%.2f box=[%d,%d,%d,%d]\n",
+                      camera_name, r.label, r.box_conf,
+                      r.box.xmin, r.box.ymin, r.box.xmax, r.box.ymax);
+        out += buf;
+    }
+    return out;
+}
+
+// 投喂一帧给 Qwen 分析（最新帧覆盖旧帧，非阻塞）
+void qwen_feed(const cv::Mat& frame, const std::string& ctx)
+{
+    std::lock_guard<std::mutex> lock(g_qwen_slot.m);
+    g_qwen_slot.frame = frame.clone();
+    g_qwen_slot.detection_context = ctx;
+    g_qwen_slot.has = true;
+}
+
+// Qwen 分析线程：消费最新帧，输出风险 JSON
+void qwen_analysis_thread()
+{
+    while (!g_qwen_stop.load()) {
+        cv::Mat frame;
+        std::string ctx;
+        {
+            std::lock_guard<std::mutex> lock(g_qwen_slot.m);
+            if (g_qwen_slot.has) {
+                frame = g_qwen_slot.frame.clone();
+                ctx = g_qwen_slot.detection_context;
+                g_qwen_slot.has = false;
+            }
+        }
+
+        if (frame.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        std::string json;
+        if (g_qwen.analyze(frame, ctx, json, 8000)) {
+            std::cerr << "[Qwen] risk analysis:\n" << json << "\n";
+        } else {
+            std::cerr << "[Qwen] analyze failed or timeout\n";
+        }
+    }
+}
+#endif // QWEN_ENABLED
 
 int calc_nv12_mpp_size(int width, int height)
 {
@@ -740,6 +814,10 @@ void inference_and_compositor_thread(
     std::array<bool, kCameraCount> have_frame{{false, false}};
     std::array<bool, kCameraCount> fresh_frame{{false, false}};
     auto last_output = std::chrono::steady_clock::now();
+#ifdef QWEN_ENABLED
+    std::array<std::string, kCameraCount> detection_text;
+    auto last_qwen_feed = std::chrono::steady_clock::now();
+#endif
 
     while (!g_read_finish.load() || !g_read_queue.empty() || !pending.empty()) {
         FrameData input;
@@ -779,6 +857,10 @@ void inference_and_compositor_thread(
                 have_frame[camera_id] = true;
                 fresh_frame[camera_id] = true;
                 g_inference_frames[camera_id].fetch_add(1, std::memory_order_relaxed);
+#ifdef QWEN_ENABLED
+                detection_text[camera_id] =
+                    detection_group_to_text(result.detection_results, labels[camera_id].c_str());
+#endif
             } else if (!result.success) {
                 std::cerr << "[NPU camera " << camera_id << "] "
                           << result.error_msg << '\n';
@@ -807,6 +889,20 @@ void inference_and_compositor_thread(
             fresh_frame.fill(false);
             last_output = now;
             made_progress = true;
+
+#ifdef QWEN_ENABLED
+            // 关键帧调度：每 2 秒（或检测到目标时）投喂一帧给 Qwen 做风险分析。
+            // Qwen 推理慢（秒级），用"最新帧覆盖"单槽避免任务堆积。
+            const bool has_target =
+                !detection_text[0].empty() || !detection_text[1].empty();
+            const auto qwen_elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_qwen_feed).count();
+            if (has_target && qwen_elapsed >= 2000) {
+                std::string ctx = detection_text[0] + detection_text[1];
+                qwen_feed(output.frame, ctx);
+                last_qwen_feed = now;
+            }
+#endif
         }
 
         if (!made_progress) {
@@ -980,6 +1076,21 @@ int main(int argc, char** argv)
                            tile_height);
     std::thread encoder(write_thread);
 
+#ifdef QWEN_ENABLED
+    // Qwen 旁路风险分析：模型路径可通过环境变量覆盖，默认相对 build 目录 ../model/
+    const std::string qwen_llm = argc > 9 ? argv[9]
+        : "../model/Qwen3-VL-2B_llm_w8a8_rk3588.rkllm";
+    const std::string qwen_vision = argc > 10 ? argv[10]
+        : "../model/Qwen3-VL-2B_vision_rk3588.rknn";
+    std::thread qwen_worker;
+    if (g_qwen.initialize(qwen_llm.c_str(), qwen_vision.c_str())) {
+        qwen_worker = std::thread(qwen_analysis_thread);
+        std::cerr << "[Main] Qwen risk analyzer started (旁路)\n";
+    } else {
+        std::cerr << "[Main] Qwen analyzer unavailable; continuing without it\n";
+    }
+#endif
+
     std::cerr << "[Main] dual-camera detection started: "
               << mipi_device << " + " << usb_device << " -> "
               << g_output_width << 'x' << g_output_height
@@ -1026,6 +1137,14 @@ int main(int argc, char** argv)
     usb_reader.join();
     compositor.join();
     encoder.join();
+
+#ifdef QWEN_ENABLED
+    g_qwen_stop = true;
+    if (qwen_worker.joinable()) {
+        qwen_worker.join();
+    }
+    g_qwen.release();
+#endif
 
     close_streamer();
 

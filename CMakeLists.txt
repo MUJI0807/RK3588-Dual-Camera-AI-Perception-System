@@ -63,6 +63,24 @@ set(RGA_INCLUDE_DIRS    ${RGA_PATH}/include)
 # 设置 RGA 库的路径
 set(RGA_LIBS            ${RGA_PATH}/lib/Linux/${LIB_ARCH}/librga.so)
 
+# 可选：Qwen3-VL 旁路风险分析（RKLLM，Rockchip 大模型运行时）
+# 若板端装了 rknn-llm 库，指定 RKLLM_PATH 后会自动启用 QWEN_ENABLED；
+# 否则 qwen_analyzer.cpp 编译为"空壳"，不影响现有双摄/推流功能。
+set(RKLLM_PATH "" CACHE PATH "Path to RKLLM (rknn-llm) install directory")
+find_path(RKLLM_INCLUDE_DIR rkllm.h
+    HINTS ${RKLLM_PATH} ${RKLLM_PATH}/include)
+find_library(RKLLM_LIBRARY NAMES rkllmrt
+    HINTS ${RKLLM_PATH} ${RKLLM_PATH}/lib ${RKLLM_PATH}/lib/Linux/${LIB_ARCH})
+if(RKLLM_INCLUDE_DIR AND RKLLM_LIBRARY)
+    message(STATUS "RKLLM found: enable Qwen3-VL risk analyzer (QWEN_ENABLED)")
+    add_definitions(-DQWEN_ENABLED)
+    include_directories(${RKLLM_INCLUDE_DIR})
+    set(RKLLM_LIBS ${RKLLM_LIBRARY})
+else()
+    message(STATUS "RKLLM not found: Qwen risk analyzer disabled (shell only)")
+    set(RKLLM_LIBS "")
+endif()
+
 
 # 将 OpenCV 的头文件路径添加到编译器的搜索路径。
 # 这使得源文件可以正确包含 OpenCV 的头文件。
@@ -81,6 +99,7 @@ add_executable(app
     lane_detector.cpp
     unet_lane_detector.cpp
     opencl_undistort.cpp
+    qwen_analyzer.cpp
     streamer.c
     rtmp.c
     mpp.c
@@ -92,6 +111,8 @@ target_link_libraries(app
     ${RKNN_LIBS}
     ${RGA_LIBS}
     ${OpenCL_LIBRARIES}
+    # Qwen3-VL 旁路风险分析（RKLLM，未找到时为空）
+    ${RKLLM_LIBS}
     # mpp的链接库
     ${MPP_LIBRARY}
     # FFmpeg的链接库
