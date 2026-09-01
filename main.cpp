@@ -139,7 +139,9 @@ void qwen_analysis_thread()
         }
 
         std::string json;
-        if (g_qwen.analyze(frame, ctx, json, 8000)) {
+        // 0.8B 实测 21.6 tok/s；风险 JSON 输出短，但生成上限 kMaxNewTokens，
+        // 超时给足 20s 避免误杀长输出
+        if (g_qwen.analyze(frame, ctx, json, 20000)) {
             std::cerr << "[Qwen] risk analysis:\n" << json << "\n";
         } else {
             std::cerr << "[Qwen] analyze failed or timeout\n";

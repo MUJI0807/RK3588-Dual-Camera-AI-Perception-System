@@ -28,7 +28,7 @@ namespace {
 constexpr int    kDefaultVisionSize    = 448;
 constexpr int    kFallbackImageTokens  = 256;     // 回退：n_image_tokens
 constexpr int    kFallbackEmbedLen     = 1536;    // 回退：每 token embedding 维度
-constexpr int    kMaxNewTokens         = 512;     // 最大生成 token 数
+constexpr int    kMaxNewTokens         = 256;     // 最大生成 token 数（风险JSON很短，256足够且更快）
 constexpr int    kMaxContextLen        = 4096;    // 最大上下文长度
 const char* const kImgStart           = "<|vision_start|>";
 const char* const kImgEnd             = "<|vision_end|>";
@@ -162,9 +162,10 @@ bool QwenAnalyzer::analyze(const cv::Mat& frame_bgr,
     }
     const int n_image_tokens = vision_ctx_.model_image_token;
     const int embed_size = vision_ctx_.model_embed_size;
-    if ((int)image_embed.size() < n_image_tokens * embed_size) {
+    const int n_out = (int)vision_ctx_.io_num.n_output;
+    if ((int)image_embed.size() < n_image_tokens * embed_size * n_out) {
         std::fprintf(stderr, "[Qwen] image_embed too small: %zu (expect %d)\n",
-                     image_embed.size(), n_image_tokens * embed_size);
+                     image_embed.size(), n_image_tokens * embed_size * n_out);
         out_json.clear();
         return false;
     }
@@ -177,6 +178,7 @@ bool QwenAnalyzer::analyze(const cv::Mat& frame_bgr,
     rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
 #ifdef QWEN_RKLLM_130
     // RKLLM 1.3.0 新版多模态结构（Qwen3.5-0.8B 等新模型）
+    rkllm_input.role = "user";   // 新版 API 需显式指定消息角色
     rkllm_input.multimodal_input.prompt = const_cast<char*>(user_prompt.c_str());
     rkllm_input.multimodal_input.image.image_embed = img_vec;
     rkllm_input.multimodal_input.image.n_image_tokens = n_image_tokens;
@@ -363,10 +365,7 @@ bool QwenAnalyzer::run_vision(const cv::Mat& rgb, std::vector<float>& image_embe
     if (!rgb.isContinuous()) return false;   // resize 后应连续；此处防御
 
     rknn_input inputs[1];
-    rknn_output outputs[1];
     std::memset(inputs, 0, sizeof(inputs));
-    std::memset(outputs, 0, sizeof(outputs));
-
     inputs[0].index = 0;
     inputs[0].type  = RKNN_TENSOR_UINT8;
     inputs[0].fmt   = RKNN_TENSOR_NHWC;
@@ -376,13 +375,30 @@ bool QwenAnalyzer::run_vision(const cv::Mat& rgb, std::vector<float>& image_embe
     if (rknn_inputs_set(vision_ctx_.rknn_ctx, 1, inputs) < 0) return false;
     if (rknn_run(vision_ctx_.rknn_ctx, nullptr) < 0) return false;
 
-    outputs[0].want_float = 1;
-    if (rknn_outputs_get(vision_ctx_.rknn_ctx, 1, outputs, nullptr) < 0) return false;
+    // 重要：Qwen3.5-0.8B 视觉编码器有 n_output 个输出，需全部拼接：
+    //   dest[token][output][embed]，总大小 = token * embed * n_output
+    const int n_out = (int)vision_ctx_.io_num.n_output;
+    const int token = vision_ctx_.model_image_token;
+    const int embed = vision_ctx_.model_embed_size;
+    if (n_out <= 0 || token <= 0 || embed <= 0) return false;
 
-    size_t n_float = outputs[0].size / sizeof(float);
-    image_embed.resize(n_float);
-    std::memcpy(image_embed.data(), outputs[0].buf, outputs[0].size);
-    rknn_outputs_release(vision_ctx_.rknn_ctx, 1, outputs);
+    std::vector<rknn_output> outputs(n_out);
+    std::memset(outputs.data(), 0, sizeof(rknn_output) * n_out);
+    for (int i = 0; i < n_out; ++i) outputs[i].want_float = 1;
+
+    if (rknn_outputs_get(vision_ctx_.rknn_ctx, n_out, outputs.data(), nullptr) < 0) return false;
+
+    image_embed.resize((size_t)token * embed * n_out);
+    float* dest = image_embed.data();
+    for (int i = 0; i < token; ++i) {
+        for (int j = 0; j < n_out; ++j) {
+            if (!outputs[j].buf) { rknn_outputs_release(vision_ctx_.rknn_ctx, n_out, outputs.data()); return false; }
+            std::memcpy(dest + (size_t)i * n_out * embed + (size_t)j * embed,
+                        static_cast<const float*>(outputs[j].buf) + (size_t)i * embed,
+                        sizeof(float) * embed);
+        }
+    }
+    rknn_outputs_release(vision_ctx_.rknn_ctx, n_out, outputs.data());
     return true;
 }
 
